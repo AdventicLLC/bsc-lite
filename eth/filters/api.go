@@ -71,12 +71,6 @@ type FilterAPI struct {
 	filters    map[rpc.ID]*filter
 	timeout    time.Duration
 	rangeLimit bool
-	// Add the block cache and related fields
-	blockCache                  map[common.Hash]*types.Block
-	blockCacheOrder             []common.Hash
-	cacheMu                     sync.Mutex
-	useBlockCache               bool
-	skipGetTransactionFromBlock bool
 }
 
 // NewFilterAPI returns a new FilterAPI instance.
@@ -87,11 +81,6 @@ func NewFilterAPI(system *FilterSystem, rangeLimit bool) *FilterAPI {
 		filters:    make(map[rpc.ID]*filter),
 		timeout:    system.cfg.Timeout,
 		rangeLimit: rangeLimit,
-		// Initialize the block cache and other fields
-		blockCache:                  make(map[common.Hash]*types.Block),
-		blockCacheOrder:             make([]common.Hash, 0),
-		useBlockCache:               true,  // Enable block cache by default
-		skipGetTransactionFromBlock: false, // Allow fallback to getTransactionFromBlock by default
 	}
 	go api.timeoutLoop(system.cfg.Timeout)
 
