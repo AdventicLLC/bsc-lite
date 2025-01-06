@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/log"
 	"math/big"
 	"sync"
 	"time"
@@ -70,6 +71,12 @@ type FilterAPI struct {
 	filters    map[rpc.ID]*filter
 	timeout    time.Duration
 	rangeLimit bool
+	// Add the block cache and related fields
+	blockCache                  map[common.Hash]*types.Block
+	blockCacheOrder             []common.Hash
+	cacheMu                     sync.Mutex
+	useBlockCache               bool
+	skipGetTransactionFromBlock bool
 }
 
 // NewFilterAPI returns a new FilterAPI instance.
@@ -80,6 +87,11 @@ func NewFilterAPI(system *FilterSystem, rangeLimit bool) *FilterAPI {
 		filters:    make(map[rpc.ID]*filter),
 		timeout:    system.cfg.Timeout,
 		rangeLimit: rangeLimit,
+		// Initialize the block cache and other fields
+		blockCache:                  make(map[common.Hash]*types.Block),
+		blockCacheOrder:             make([]common.Hash, 0),
+		useBlockCache:               true,  // Enable block cache by default
+		skipGetTransactionFromBlock: false, // Allow fallback to getTransactionFromBlock by default
 	}
 	go api.timeoutLoop(system.cfg.Timeout)
 
@@ -115,60 +127,6 @@ func (api *FilterAPI) timeoutLoop(timeout time.Duration) {
 		toUninstall = nil
 	}
 }
-
-/** Start custom implementation **/
-func doTxMapping(txns []*types.Transaction, f func(*types.Transaction) common.Hash) []common.Hash {
-	mappedTxns := make([]common.Hash, len(txns))
-	for i, v := range txns {
-		mappedTxns[i] = f(v)
-	}
-	return mappedTxns
-}
-
-func getFullTransaction(tx *types.Transaction) *ethapi.RPCTransaction {
-	if tx == nil {
-		return nil
-	}
-	var signer types.Signer
-	if tx.Protected() {
-		signer = types.LatestSignerForChainID(tx.ChainId())
-	} else {
-		signer = types.HomesteadSigner{}
-	}
-	from, _ := types.Sender(signer, tx)
-	v, r, s := tx.RawSignatureValues()
-	result := &ethapi.RPCTransaction{
-		Type:     hexutil.Uint64(tx.Type()),
-		From:     from,
-		Gas:      hexutil.Uint64(tx.Gas()),
-		GasPrice: (*hexutil.Big)(tx.GasPrice()),
-		Hash:     tx.Hash(),
-		Input:    hexutil.Bytes(tx.Data()),
-		Nonce:    hexutil.Uint64(tx.Nonce()),
-		To:       tx.To(),
-		Value:    (*hexutil.Big)(tx.Value()),
-		V:        (*hexutil.Big)(v),
-		R:        (*hexutil.Big)(r),
-		S:        (*hexutil.Big)(s),
-	}
-	switch tx.Type() {
-	case types.AccessListTxType:
-		al := tx.AccessList()
-		result.Accesses = &al
-		result.ChainID = (*hexutil.Big)(tx.ChainId())
-	case types.DynamicFeeTxType:
-		al := tx.AccessList()
-		result.Accesses = &al
-		result.ChainID = (*hexutil.Big)(tx.ChainId())
-		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
-		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
-		// if the transaction has been mined, compute the effective gas price
-		result.GasPrice = nil
-	}
-	return result
-}
-
-/** End custom implementation **/
 
 // NewPendingTransactionFilter creates a filter that fetches pending transactions
 // as transactions enter the pending state.
@@ -235,7 +193,7 @@ func (api *FilterAPI) NewPendingTransactions(ctx context.Context, fullTx *bool) 
 				for _, t := range transactions {
 					if fullTx != nil && *fullTx {
 						rpcTx := ethapi.NewRPCPendingTransaction(t, latest, chainConfig)
-						notifier.Notify(rpcSub.ID, rpcTx) // todo cast RPCTX
+						notifier.Notify(rpcSub.ID, rpcTx)
 					} else {
 						notifier.Notify(rpcSub.ID, getFullTransaction(t))
 					}
@@ -341,7 +299,81 @@ func (api *FilterAPI) NewBlockFilter() rpc.ID {
 	return headerSub.ID
 }
 
-// NewHeads send a notification each time a new (header) block is appended to the chain.
+// ExtendedHeader represents a block header extended with transactions.
+type ExtendedHeader struct {
+	*types.Header
+	Transactions []*RPCTransactionWithLogs `json:"transactions"`
+}
+
+// RPCTransactionWithLogs represents a transaction with logs.
+type RPCTransactionWithLogs struct {
+	*ethapi.RPCTransaction
+	Logs []*LogWithFrom `json:"logs"`
+}
+
+type LogWithFrom struct {
+	*types.Log
+	From common.Address `json:"from"`
+}
+
+func doTxMapping(txns []*types.Transaction, f func(*types.Transaction) common.Hash) []common.Hash {
+	mappedTxns := make([]common.Hash, len(txns))
+	for i, v := range txns {
+		mappedTxns[i] = f(v)
+	}
+	return mappedTxns
+}
+
+// getFullTransaction retrieves the full transaction including the 'from' address.
+func getFullTransaction(tx *types.Transaction) *ethapi.RPCTransaction {
+	if tx == nil {
+		return nil
+	}
+	// Retrieve the chain ID from the transaction
+	chainID := tx.ChainId()
+	if chainID == nil {
+		// Handle the case where chainID is nil
+		chainID = big.NewInt(56) // Default to BSC Mainnet chain ID
+	}
+	// Use the EIP-155 signer with the retrieved chain ID
+	signer := types.NewEIP155Signer(chainID)
+	from, _ := types.Sender(signer, tx)
+	v, r, s := tx.RawSignatureValues()
+	result := &ethapi.RPCTransaction{
+		Type:     hexutil.Uint64(tx.Type()),
+		From:     from,
+		Gas:      hexutil.Uint64(tx.Gas()),
+		GasPrice: (*hexutil.Big)(tx.GasPrice()),
+		Hash:     tx.Hash(),
+		Input:    hexutil.Bytes(tx.Data()),
+		Nonce:    hexutil.Uint64(tx.Nonce()),
+		To:       tx.To(),
+		Value:    (*hexutil.Big)(tx.Value()),
+		V:        (*hexutil.Big)(v),
+		R:        (*hexutil.Big)(r),
+		S:        (*hexutil.Big)(s),
+	}
+	return result
+}
+
+// getFullLogs converts receipt logs to LogWithFrom, including the 'from' address.
+func getFullLogs(receipt *types.Receipt, from common.Address) []*LogWithFrom {
+	if receipt == nil {
+		return nil
+	}
+	logs := make([]*LogWithFrom, len(receipt.Logs))
+	for i, logEntry := range receipt.Logs {
+		rpcLog := &LogWithFrom{
+			Log:  logEntry,
+			From: from,
+		}
+		logs[i] = rpcLog
+	}
+	return logs
+}
+
+// NewHeads sends a notification each time a new block header is appended to the chain,
+// including the transactions in the block with their logs.
 func (api *FilterAPI) NewHeads(ctx context.Context) (*rpc.Subscription, error) {
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
@@ -358,7 +390,51 @@ func (api *FilterAPI) NewHeads(ctx context.Context) (*rpc.Subscription, error) {
 		for {
 			select {
 			case h := <-headers:
-				notifier.Notify(rpcSub.ID, h)
+				// Fetch the block body using GetBody
+				blockNumber := rpc.BlockNumber(h.Number.Int64())
+				blockBody, err := api.sys.backend.GetBody(ctx, h.Hash(), blockNumber)
+				if err != nil {
+					log.Error("Failed to fetch block body", "hash", h.Hash(), "err", err)
+					continue
+				}
+
+				transactions := blockBody.Transactions
+
+				// Fetch receipts for the block
+				receipts, err := api.sys.backend.GetReceipts(ctx, h.Hash())
+				if err != nil {
+					log.Error("Failed to fetch block receipts", "hash", h.Hash(), "err", err)
+					continue
+				}
+
+				// Convert transactions to RPCTransactionWithLogs
+				transactionsData := make([]*RPCTransactionWithLogs, len(transactions))
+				for i, tx := range transactions {
+					// Get the full transaction data, including the 'from' address
+					rpcTx := getFullTransaction(tx)
+
+					// Get the logs from the receipt
+					var logsWithFrom []*LogWithFrom
+					if i < len(receipts) && receipts[i] != nil {
+						logsWithFrom = getFullLogs(receipts[i], rpcTx.From)
+					}
+
+					txData := &RPCTransactionWithLogs{
+						RPCTransaction: rpcTx,
+						Logs:           logsWithFrom,
+					}
+					transactionsData[i] = txData
+				}
+
+				// Create the ExtendedHeader object.
+				extendedHeader := &ExtendedHeader{
+					Header:       h,
+					Transactions: transactionsData,
+				}
+
+				// Notify the subscriber with the extended header.
+				notifier.Notify(rpcSub.ID, extendedHeader)
+
 			case <-rpcSub.Err():
 				return
 			}
@@ -450,7 +526,7 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 			case l := <-logs:
 				for _, logEntry := range l {
 					// Retrieve the transaction from the block body
-					tx, err := api.getTransactionFromBlock(ctx, logEntry.BlockHash, rpc.BlockNumber(logEntry.BlockNumber), logEntry.TxHash)
+					/*tx, err := api.getTransactionFromBlock(ctx, logEntry.BlockHash, rpc.BlockNumber(logEntry.BlockNumber), logEntry.TxHash)
 					if err != nil {
 						// Handle error, possibly log and continue
 						continue
@@ -471,20 +547,20 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 					if err != nil {
 						// Handle error, possibly log and continue
 						continue
-					}
+					}*/
 
 					// Construct the RPCLog with the 'From' address
-					rpcLog := &types.RPCLog{
+					rpcLog := &types.Log{
 						Address:     logEntry.Address,
 						Topics:      logEntry.Topics,
 						Data:        logEntry.Data,
-						BlockNumber: hexutil.Uint64(logEntry.BlockNumber),
+						BlockNumber: logEntry.BlockNumber,
 						TxHash:      logEntry.TxHash,
-						TxIndex:     hexutil.Uint(logEntry.TxIndex),
+						TxIndex:     logEntry.TxIndex,
 						BlockHash:   logEntry.BlockHash,
-						Index:       hexutil.Uint(logEntry.Index),
+						Index:       logEntry.Index,
 						Removed:     logEntry.Removed,
-						From:        from,
+						//From:        from,
 					}
 
 					// Send the enriched log to the subscriber
