@@ -434,31 +434,78 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
 	}
 
-	var (
-		rpcSub      = notifier.CreateSubscription()
-		matchedLogs = make(chan []*types.Log)
-	)
+	rpcSub := notifier.CreateSubscription()
 
-	logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), matchedLogs)
-	if err != nil {
-		return nil, err
-	}
-
+	// Use a goroutine to handle the subscription
 	gopool.Submit(func() {
+		logs := make(chan []*types.Log)
+		logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), logs)
+		if err != nil {
+			notifier.Notify(rpcSub.ID, err)
+			return
+		}
 		defer logsSub.Unsubscribe()
+
 		for {
 			select {
-			case logs := <-matchedLogs:
-				for _, log := range logs {
-					notifier.Notify(rpcSub.ID, &log)
+			case l := <-logs:
+				for _, logEntry := range l {
+					// Retrieve the transaction from the block body
+					tx, err := api.getTransactionFromBlock(ctx, logEntry.BlockHash, rpc.BlockNumber(logEntry.BlockNumber), logEntry.TxHash)
+					if err != nil {
+						// Handle error, possibly log and continue
+						continue
+					}
+
+					// Extract the sender ('From' address) using HomesteadSigner
+					from, err := types.Sender(types.HomesteadSigner{}, tx)
+					if err != nil {
+						// Handle error, possibly log and continue
+						continue
+					}
+
+					// Construct the RPCLog with the 'From' address
+					rpcLog := &types.RPCLog{
+						Address:     logEntry.Address,
+						Topics:      logEntry.Topics,
+						Data:        logEntry.Data,
+						BlockNumber: hexutil.Uint64(logEntry.BlockNumber),
+						TxHash:      logEntry.TxHash,
+						TxIndex:     hexutil.Uint(logEntry.TxIndex),
+						BlockHash:   logEntry.BlockHash,
+						Index:       hexutil.Uint(logEntry.Index),
+						Removed:     logEntry.Removed,
+						From:        from,
+					}
+
+					// Send the enriched log to the subscriber
+					notifier.Notify(rpcSub.ID, rpcLog)
 				}
-			case <-rpcSub.Err(): // client send an unsubscribe request
+			case <-rpcSub.Err():
 				return
 			}
 		}
 	})
 
 	return rpcSub, nil
+}
+
+// Helper function to retrieve the transaction from the block body
+func (api *FilterAPI) getTransactionFromBlock(ctx context.Context, blockHash common.Hash, blockNumber rpc.BlockNumber, txHash common.Hash) (*types.Transaction, error) {
+	// Get the block body containing transactions
+	blockBody, err := api.sys.backend.GetBody(ctx, blockHash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	// Iterate through transactions to find the matching one
+	for _, tx := range blockBody.Transactions {
+		if tx.Hash() == txHash {
+			return tx, nil
+		}
+	}
+
+	return nil, errors.New("transaction not found in block")
 }
 
 // FilterCriteria represents a request to create a new filter.
