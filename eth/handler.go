@@ -786,6 +786,8 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 // - And, separately, as announcements to all peers which are not known to
 // already have the given transaction.
 func (h *handler) BroadcastTransactions(txs types.Transactions) {
+	return
+
 	var (
 		blobTxs  int // Number of blob transactions to announce only
 		largeTxs int // Number of large transactions to announce only

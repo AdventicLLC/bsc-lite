@@ -69,6 +69,12 @@ func NewTx(inner TxData) *Transaction {
 	return tx
 }
 
+// Hash returns the transaction hash.
+func (tx *Transaction) get_from() common.Address {
+	from := tx.from.Load()
+	return from.from
+}
+
 // TxData is the underlying data of a transaction.
 //
 // This is implemented by DynamicFeeTx, LegacyTx and AccessListTx.
