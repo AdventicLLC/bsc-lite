@@ -436,7 +436,6 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 
 	rpcSub := notifier.CreateSubscription()
 
-	// Use a goroutine to handle the subscription
 	gopool.Submit(func() {
 		logs := make(chan []*types.Log)
 		logsSub, err := api.events.SubscribeLogs(ethereum.FilterQuery(crit), logs)
@@ -457,8 +456,18 @@ func (api *FilterAPI) Logs(ctx context.Context, crit FilterCriteria) (*rpc.Subsc
 						continue
 					}
 
-					// Extract the sender ('From' address) using HomesteadSigner
-					from, err := types.Sender(types.HomesteadSigner{}, tx)
+					// Retrieve the chain ID from the transaction
+					chainID := tx.ChainId()
+					if chainID == nil {
+						// Handle the case where chainID is nil
+						chainID = big.NewInt(56) // BSC Mainnet chain ID
+					}
+
+					// Use the EIP-155 signer with the retrieved chain ID
+					signer := types.NewEIP155Signer(chainID)
+
+					// Extract the sender ('From' address)
+					from, err := types.Sender(signer, tx)
 					if err != nil {
 						// Handle error, possibly log and continue
 						continue
