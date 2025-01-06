@@ -116,6 +116,60 @@ func (api *FilterAPI) timeoutLoop(timeout time.Duration) {
 	}
 }
 
+/** Start custom implementation **/
+func doTxMapping(txns []*types.Transaction, f func(*types.Transaction) common.Hash) []common.Hash {
+	mappedTxns := make([]common.Hash, len(txns))
+	for i, v := range txns {
+		mappedTxns[i] = f(v)
+	}
+	return mappedTxns
+}
+
+func getFullTransaction(tx *types.Transaction) *ethapi.RPCTransaction {
+	if tx == nil {
+		return nil
+	}
+	var signer types.Signer
+	if tx.Protected() {
+		signer = types.LatestSignerForChainID(tx.ChainId())
+	} else {
+		signer = types.HomesteadSigner{}
+	}
+	from, _ := types.Sender(signer, tx)
+	v, r, s := tx.RawSignatureValues()
+	result := &ethapi.RPCTransaction{
+		Type:     hexutil.Uint64(tx.Type()),
+		From:     from,
+		Gas:      hexutil.Uint64(tx.Gas()),
+		GasPrice: (*hexutil.Big)(tx.GasPrice()),
+		Hash:     tx.Hash(),
+		Input:    hexutil.Bytes(tx.Data()),
+		Nonce:    hexutil.Uint64(tx.Nonce()),
+		To:       tx.To(),
+		Value:    (*hexutil.Big)(tx.Value()),
+		V:        (*hexutil.Big)(v),
+		R:        (*hexutil.Big)(r),
+		S:        (*hexutil.Big)(s),
+	}
+	switch tx.Type() {
+	case types.AccessListTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+	case types.DynamicFeeTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		// if the transaction has been mined, compute the effective gas price
+		result.GasPrice = nil
+	}
+	return result
+}
+
+/** End custom implementation **/
+
 // NewPendingTransactionFilter creates a filter that fetches pending transactions
 // as transactions enter the pending state.
 //
@@ -133,10 +187,13 @@ func (api *FilterAPI) NewPendingTransactionFilter(fullTx *bool) rpc.ID {
 	gopool.Submit(func() {
 		for {
 			select {
-			case pTx := <-pendingTxs:
+			case ptxn := <-pendingTxs:
+				h := doTxMapping(ptxn, func(txn *types.Transaction) common.Hash {
+					return txn.Hash()
+				})
 				api.filtersMu.Lock()
 				if f, found := api.filters[pendingTxSub.ID]; found {
-					f.txs = append(f.txs, pTx...)
+					f.hashes = append(f.hashes, h...)
 				}
 				api.filtersMu.Unlock()
 			case <-pendingTxSub.Err():
@@ -171,16 +228,16 @@ func (api *FilterAPI) NewPendingTransactions(ctx context.Context, fullTx *bool) 
 
 		for {
 			select {
-			case txs := <-txs:
+			case transactions := <-txs:
 				// To keep the original behaviour, send a single tx hash in one notification.
 				// TODO(rjl493456442) Send a batch of tx hashes in one notification
 				latest := api.sys.backend.CurrentHeader()
-				for _, tx := range txs {
+				for _, t := range transactions {
 					if fullTx != nil && *fullTx {
-						rpcTx := ethapi.NewRPCPendingTransaction(tx, latest, chainConfig)
-						notifier.Notify(rpcSub.ID, rpcTx)
+						rpcTx := ethapi.NewRPCPendingTransaction(t, latest, chainConfig)
+						notifier.Notify(rpcSub.ID, rpcTx) // todo cast RPCTX
 					} else {
-						notifier.Notify(rpcSub.ID, tx.Hash())
+						notifier.Notify(rpcSub.ID, getFullTransaction(t))
 					}
 				}
 			case <-rpcSub.Err():
